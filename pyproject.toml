@@ -1,0 +1,17 @@
+[project]
+name = "claude-code-mlx-proxy"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Daniel Bacsur", email = "daniel@danielbacsur.dev" }
+]
+requires-python = ">=3.15"
+dependencies = []
+
+[project.scripts]
+claude-code-mlx-proxy = "claude_code_mlx_proxy:main"
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"
