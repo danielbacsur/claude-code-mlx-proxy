@@ -7,6 +7,9 @@ version = "0.1.0"
 dependencies = [ "mlx-lm>=0.31.3" ]
 requires-python = ">=3.10,<3.15"
 
+readme = "readme.md"
+license = "MIT"
+license-files = [ "license" ]
 
 [project.scripts]
 claude-code-mlx-proxy = "claude_code_mlx_proxy:main"
