@@ -19,8 +19,8 @@ UPSTREAM = urlsplit(f"http://{HOST}:8080")
 # mlx_lm.server's name for the model it started with, so it never loads another.
 MODEL = "default_model"
 
-# Port the proxy listens on when standalone; wrapping a command picks a free one.
-PORT = 8082
+# Default --listen port when standalone; wrapping a command picks a free one instead.
+PORT = 41817
 
 # finish_reason tool_calls maps to tool_use only if a call survived mlx's parser.
 STOP = {"length": "max_tokens"}
@@ -703,10 +703,10 @@ def context_window(model):
     return cfg.get("text_config", cfg).get("max_position_embeddings")
 
 
-# Runs the wrapped command against a proxy on a free port, with the base URL, the model
-# name and the context window set in its environment, and returns its exit code.
-def run(cmd, model):
-    server = ThreadingHTTPServer((HOST, 0), Handler)
+# Runs the wrapped command against a proxy on the --listen port or a free one, with the
+# base URL, model name and context window in its environment, returning its exit code.
+def run(cmd, model, port, context):
+    server = ThreadingHTTPServer((HOST, port), Handler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
@@ -716,8 +716,10 @@ def run(cmd, model):
     if model:
         env.setdefault("ANTHROPIC_MODEL", model)
 
-    # A context window the user set beats the one from the model's config.
-    if model and (window := context_window(model)):
+    # An explicit --context wins; otherwise a value the user set beats the model's.
+    if context:
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = context
+    elif model and (window := context_window(model)):
         env.setdefault("CLAUDE_CODE_MAX_CONTEXT_TOKENS", str(window))
 
     context = env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "unknown")
@@ -752,6 +754,10 @@ def main():
         i = args.index("--")
         args, cmd = args[:i], args[i + 1 :]
 
+    # The proxy's own two flags; everything else before -- belongs to the server.
+    listen = flag(args, "--listen", remove=True)
+    context = flag(args, "--context", remove=True)
+
     # The server lives wherever its own --host and --port flags put it.
     host = flag(args, "--host") or HOST
     UPSTREAM = urlsplit(f"http://{host}:{flag(args, '--port') or 8080}")
@@ -784,12 +790,13 @@ def main():
 
             if cmd:
                 LOG = log
-                sys.exit(run(cmd, model))
+                sys.exit(run(cmd, model, int(listen or 0), context))
 
-            server = ThreadingHTTPServer((HOST, PORT), Handler)
+            port = int(listen or PORT)
+            server = ThreadingHTTPServer((HOST, port), Handler)
             server.daemon_threads = True
 
-            say(f"proxy on http://{HOST}:{PORT} -> {UPSTREAM.geturl()}")
+            say(f"proxy on http://{HOST}:{port} -> {UPSTREAM.geturl()}")
 
             server.serve_forever()
         except KeyboardInterrupt:
