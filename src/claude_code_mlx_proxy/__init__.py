@@ -449,7 +449,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             self.relay(req)
-        except BrokenPipeError, ConnectionResetError:
+        except (BrokenPipeError, ConnectionResetError):
             pass
 
     # Sends a translated request to mlx_lm.server and returns its answer as an Anthropic
@@ -493,7 +493,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 try:
                     raw = json.loads(raw).get("error", raw)
-                except ValueError, AttributeError:
+                except (ValueError, AttributeError):
                     pass
 
                 msg = (

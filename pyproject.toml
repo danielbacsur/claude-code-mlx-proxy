@@ -1,11 +1,12 @@
 [project]
 name = "claude-code-mlx-proxy"
-description = "A local proxy that brings MLX models into Claude Code."
 authors = [ { name = "Daniel Bacsur", email = "daniel@danielbacsur.dev" } ]
+description = "A local proxy that brings MLX models into Claude Code."
 
 version = "0.1.0"
-requires-python = ">=3.15"
-dependencies = []
+dependencies = [ "mlx-lm>=0.31.3" ]
+requires-python = ">=3.10,<3.15"
+
 
 [project.scripts]
 claude-code-mlx-proxy = "claude_code_mlx_proxy:main"
