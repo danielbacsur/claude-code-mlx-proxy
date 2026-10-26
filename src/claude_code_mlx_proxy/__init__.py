@@ -1,6 +1,9 @@
 import http.client
 import json
+import os
+import subprocess
 import sys
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
@@ -8,7 +11,7 @@ from urllib.parse import urlsplit
 # Address the proxy listens on, and the default address of the model server.
 HOST = "127.0.0.1"
 
-# Where mlx_lm.server answers, at its own default port on the same machine as the proxy.
+# Where mlx_lm.server answers; main resets it from the server's --host and --port.
 UPSTREAM = urlsplit(f"http://{HOST}:8080")
 
 # mlx_lm.server's name for the model it started with, so it never loads another.
@@ -20,7 +23,16 @@ PORT = 8082
 # finish_reason tool_calls maps to tool_use only if a call survived mlx's parser.
 STOP = {"length": "max_tokens"}
 
-# Where the proxy writes its access log; stderr, next to its own status line.
+# Model the wrapper starts mlx_lm.server with when the user passes no --model flag.
+DEFAULT_MODEL = "mlx-community/Qwen3.5-4B-MLX-4bit"
+
+# File that receives the output of the mlx_lm.server process the proxy started.
+LOG_PATH = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "claude-code-mlx-proxy.log",
+)
+
+# Where the proxy writes its access log, kept apart from the server's own log file.
 LOG = sys.stderr
 
 # Anthropic error types for upstream status codes; any other code becomes api_error.
@@ -568,18 +580,131 @@ class Handler(BaseHTTPRequestHandler):
             )
 
 
-# Serves the proxy on its port until it is interrupted, translating every request for
-# the mlx_lm.server that is already running at the upstream address on this machine.
-def main():
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    server.daemon_threads = True
+# Prints a status line for the person running the proxy to stderr, with a fixed prefix
+# so that it stands apart from all of the access log lines the proxy writes there.
+def say(msg):
+    print(f"claude-code-mlx-proxy: {msg}", file=sys.stderr, flush=True)
 
-    print(f"proxy on http://{HOST}:{PORT} -> {UPSTREAM.geturl()}", file=sys.stderr)
+
+# Finds the value of a flag given as --name value or as --name=value in the argument
+# list, and can also remove that flag from the list once its value has been read.
+def flag(args, name, remove=False):
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            value = args[i + 1]
+
+            if remove:
+                del args[i : i + 2]
+
+            return value
+
+        if a.startswith(name + "="):
+            if remove:
+                del args[i]
+
+            return a.split("=", 1)[1]
+
+    return None
+
+
+# Checks whether a model server already answers at the upstream address by asking for
+# its model list, using a short timeout so that the wrapper still starts quickly.
+def upstream_alive():
+    conn = http.client.HTTPConnection(UPSTREAM.hostname, UPSTREAM.port or 80, timeout=2)
 
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        conn.request("GET", "/v1/models")
+        return conn.getresponse().status == 200
+    except OSError:
+        return False
+    finally:
+        conn.close()
+
+
+# Starts the bundled mlx_lm.server with the user's arguments and the default model when
+# none is given, in a session of its own and with all of its output going to the log.
+def start_server(args, log):
+    if flag(args, "--model") is None:
+        args += ["--model", DEFAULT_MODEL]
+
+    say(f"starting mlx_lm.server with {flag(args, '--model')}, log in {LOG_PATH}")
+
+    # Its own session, so a Ctrl-C meant for the wrapped program never reaches it.
+    return subprocess.Popen(
+        [sys.executable, "-m", "mlx_lm", "server", *args],
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+
+# Waits until the freshly started model server answers its first request, and exits with
+# a pointer to the log file when the server process dies before it becomes ready.
+def wait_ready(proc):
+    while not upstream_alive():
+        if proc.poll() is not None:
+            sys.exit(
+                f"claude-code-mlx-proxy: mlx_lm.server exited with code "
+                f"{proc.returncode}, see {LOG_PATH}"
+            )
+
+        time.sleep(0.5)
+
+
+# Stops a model server that this process started itself, asking it to terminate first
+# and killing it outright when it is still running after ten seconds of waiting.
+def stop_server(proc):
+    if proc and proc.poll() is None:
+        proc.terminate()
+
+        try:
+            proc.wait(10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+# Makes sure a model server is running and starts one with the given arguments if
+# needed, then serves the proxy on its port until it is interrupted or killed.
+def main():
+    global UPSTREAM
+
+    args = sys.argv[1:]
+
+    # The server lives wherever its own --host and --port flags put it.
+    host = flag(args, "--host") or HOST
+    UPSTREAM = urlsplit(f"http://{host}:{flag(args, '--port') or 8080}")
+
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    proc = None
+
+    with open(LOG_PATH, "w") as log:
+        try:
+            if upstream_alive():
+                unused = list(args)
+
+                for name in ("--host", "--port"):
+                    flag(unused, name, remove=True)
+
+                if unused:
+                    say(
+                        f"using the server at {UPSTREAM.geturl()}, "
+                        f"ignoring: {' '.join(unused)}"
+                    )
+            else:
+                proc = start_server(args, log)
+                wait_ready(proc)
+
+            server = ThreadingHTTPServer((HOST, PORT), Handler)
+            server.daemon_threads = True
+
+            say(f"proxy on http://{HOST}:{PORT} -> {UPSTREAM.geturl()}")
+
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop_server(proc)
 
 
 if __name__ == "__main__":
