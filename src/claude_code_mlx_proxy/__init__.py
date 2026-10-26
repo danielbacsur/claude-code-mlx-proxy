@@ -542,11 +542,16 @@ class Handler(BaseHTTPRequestHandler):
         return send
 
     # Relays the upstream event stream line by line as Anthropic events, and ends the
-    # response with an error event when the upstream reports an error itself.
+    # response with an error event whenever the stream breaks before it has finished.
     def stream(self, resp, out):
         try:
             for line in resp:
                 line = line.strip()
+
+                # mlx sends keepalive comments while it prefills a prompt; answering
+                # each one with a ping lets the proxy notice a client that has gone.
+                if line.startswith(b":"):
+                    out.send("ping", {"type": "ping"})
 
                 if not line.startswith(b"data:"):
                     continue
@@ -564,6 +569,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise RuntimeError(message or str(err))
 
                 out.chunk(data)
+
+            # mlx_lm.server just closes the socket when generation dies mid-stream.
+            raise RuntimeError("upstream closed the stream early")
         except (
             OSError,
             ValueError,
