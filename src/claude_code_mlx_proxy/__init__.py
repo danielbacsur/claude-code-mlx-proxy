@@ -1,8 +1,10 @@
 import http.client
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,7 +19,7 @@ UPSTREAM = urlsplit(f"http://{HOST}:8080")
 # mlx_lm.server's name for the model it started with, so it never loads another.
 MODEL = "default_model"
 
-# Port the proxy listens on, chosen to sit right next to mlx_lm.server's own default.
+# Port the proxy listens on when standalone; wrapping a command picks a free one.
 PORT = 8082
 
 # finish_reason tool_calls maps to tool_use only if a call survived mlx's parser.
@@ -26,13 +28,13 @@ STOP = {"length": "max_tokens"}
 # Model the wrapper starts mlx_lm.server with when the user passes no --model flag.
 DEFAULT_MODEL = "mlx-community/Qwen3.5-4B-MLX-4bit"
 
-# File that receives the output of the mlx_lm.server process the proxy started.
+# File for the output of mlx_lm.server and, while wrapping a command, the proxy log.
 LOG_PATH = os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
     "claude-code-mlx-proxy.log",
 )
 
-# Where the proxy writes its access log, kept apart from the server's own log file.
+# Where the proxy writes its access log; main points it at LOG_PATH when wrapping.
 LOG = sys.stderr
 
 # Anthropic error types for upstream status codes; any other code becomes api_error.
@@ -385,8 +387,8 @@ class Stream:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    # Writes one access log line for every request the proxy handles, with a short
-    # prefix so that it stands apart from the status lines printed around it.
+    # Writes one access log line for every request the proxy handles, to stderr when it
+    # runs standalone and to the shared log file while it is wrapping another command.
     def log_message(self, fmt, *args):
         LOG.write("proxy: " + fmt % args + "\n")
         LOG.flush()
@@ -580,8 +582,8 @@ class Handler(BaseHTTPRequestHandler):
             )
 
 
-# Prints a status line for the person running the proxy to stderr, with a fixed prefix
-# so that it stands apart from all of the access log lines the proxy writes there.
+# Prints a status line for the person running the wrapper to stderr, with a fixed prefix
+# so that it stands apart from everything that the wrapped command itself prints.
 def say(msg):
     print(f"claude-code-mlx-proxy: {msg}", file=sys.stderr, flush=True)
 
@@ -664,16 +666,91 @@ def stop_server(proc):
             proc.kill()
 
 
-# Makes sure a model server is running and starts one with the given arguments if
-# needed, then serves the proxy on its port until it is interrupted or killed.
-def main():
-    global UPSTREAM
+# Finds the local folder of a model, which is either a path the user gave directly or
+# the current snapshot of a Hugging Face repository in the hub cache on this machine.
+def model_dir(model):
+    if os.path.isdir(model):
+        return model
 
-    args = sys.argv[1:]
+    home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    hub = os.environ.get("HF_HUB_CACHE") or os.path.join(home, "hub")
+    repo = os.path.join(hub, "models--" + model.replace("/", "--"))
+
+    try:
+        with open(os.path.join(repo, "refs", "main")) as f:
+            return os.path.join(repo, "snapshots", f.read().strip())
+    except OSError:
+        return None
+
+
+# Reads the trained context window from the model's config.json, so Claude Code knows
+# the real limit of the model instead of warning about one it does not recognize.
+def context_window(model):
+    try:
+        with open(os.path.join(model_dir(model), "config.json")) as f:
+            cfg = json.load(f)
+    except (OSError, TypeError, ValueError):
+        return None
+
+    return cfg.get("text_config", cfg).get("max_position_embeddings")
+
+
+# Runs the wrapped command against a proxy on a free port, with the base URL, the model
+# name and the context window set in its environment, and returns its exit code.
+def run(cmd, model):
+    server = ThreadingHTTPServer((HOST, 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    url = f"http://{HOST}:{server.server_address[1]}"
+    env = dict(os.environ, ANTHROPIC_BASE_URL=url)
+
+    if model:
+        env.setdefault("ANTHROPIC_MODEL", model)
+
+    # A context window the user set beats the one from the model's config.
+    if model and (window := context_window(model)):
+        env.setdefault("CLAUDE_CODE_MAX_CONTEXT_TOKENS", str(window))
+
+    context = env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "unknown")
+    say(f"running {cmd[0]} on {model or 'the running model'}, context {context}")
+
+    try:
+        child = subprocess.Popen(cmd, env=env)
+    except OSError as e:
+        say(f"cannot run {cmd[0]}: {e.strerror}")
+        return 127
+
+    # The terminal sends Ctrl-C to the child too; the wrapper must not die of it.
+    signal.signal(signal.SIGINT, lambda *a: None)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda s, f: child.send_signal(s))
+
+    code = child.wait()
+    server.shutdown()
+
+    return code if code >= 0 else 128 - code
+
+
+# Splits the arguments at --, makes sure a model server is running and starts one if
+# needed, then either wraps the given command or keeps serving as a standalone proxy.
+def main():
+    global UPSTREAM, LOG
+
+    args, cmd = sys.argv[1:], []
+
+    if "--" in args:
+        i = args.index("--")
+        args, cmd = args[:i], args[i + 1 :]
 
     # The server lives wherever its own --host and --port flags put it.
     host = flag(args, "--host") or HOST
     UPSTREAM = urlsplit(f"http://{host}:{flag(args, '--port') or 8080}")
+
+    # kill or a closed terminal must still stop a server we started.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *a: sys.exit(0))
 
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     proc = None
@@ -694,6 +771,12 @@ def main():
             else:
                 proc = start_server(args, log)
                 wait_ready(proc)
+
+            model = flag(args, "--model")
+
+            if cmd:
+                LOG = log
+                sys.exit(run(cmd, model))
 
             server = ThreadingHTTPServer((HOST, PORT), Handler)
             server.daemon_threads = True
